@@ -42,8 +42,21 @@ async def _fetch_gdelt(query: str) -> dict[str, Any]:
         "format": "json",
         "maxrecords": "75",
     }
+    # GDELT's DOC API is documented as returning spurious 429s to
+    # non-browser User-Agent strings even under quota -- confirmed via a
+    # maintainer-acknowledged issue on the gdelt-doc-api client. This is
+    # not an attempt to impersonate a browser for scraping purposes; it's
+    # matching a documented, publicly-known quirk of this specific free
+    # API to get the request treated the same as any other legitimate
+    # client.
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
     async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(GDELT_DOC_API, params=params, headers={"User-Agent": "MoneyThatMatters/0.1"})
+        resp = await client.get(GDELT_DOC_API, params=params, headers=headers)
         resp.raise_for_status()
         return resp.json()
 

@@ -31,8 +31,19 @@ from ..universe import tracked_universe
 # request from these hosts in the first place. Business/markets-desk feeds
 # specifically, per the "markets/business desk" requirement of the subject
 # gate (not each outlet's general/world-news feed).
+#
+# Reuters' public RSS feeds (feeds.reuters.com and reuters.com/*/rss
+# paths) are confirmed DEAD as of March 2026 -- multiple independent
+# reports (GitHub issue threads, RSS-tooling docs) describe them as
+# returning nothing or erroring, consistent with what this app's own
+# first live run observed (401 Forbidden). Reuters remains on the
+# allow-list in allowlist.py for attribution purposes (e.g. Reuters
+# content reached via a licensed API or aggregator that names Reuters as
+# the original source), but it is NOT pulled via RSS here because there
+# is no working public feed to pull. Do not re-add a Reuters RSS URL
+# without first verifying it actually returns 200 with real content --
+# see this comment's history for why that check matters.
 RSS_FEEDS: dict[str, str] = {
-    "https://www.reuters.com/markets/rss": "Reuters",
     "https://www.cnbc.com/id/10001147/device/rss/rss.html": "CNBC (Markets)",
     # Bloomberg and WSJ do not offer full public RSS for markets content;
     # in production these are reached via their official partner feeds or

@@ -40,25 +40,51 @@ RECENCY_HALF_LIFE_DAYS = {
 }
 
 
-async def _run_source(name: str, coro) -> tuple[str, list | Exception]:
-    """Wrap one fetcher so a single failing source doesn't cancel the others."""
+async def _run_source(name: str, coro, timeout_seconds: float) -> tuple[str, list | Exception]:
+    """Wrap one fetcher so a single failing OR HANGING source doesn't
+    block the others. Each fetcher already sets its own httpx-level
+    timeout, but that alone isn't a sufficient guarantee -- a slow trickle
+    of bytes can keep individual read operations under their own timeout
+    while the overall call runs far longer than intended (this is exactly
+    what happened with the Congress fetcher's first live run: it never
+    raised, it just never finished). wait_for is the actual hard ceiling."""
     try:
-        result = await coro
+        result = await asyncio.wait_for(coro, timeout=timeout_seconds)
         return name, result
+    except asyncio.TimeoutError:
+        logger.warning("Fetcher %s exceeded %.0fs hard timeout, aborting", name, timeout_seconds)
+        return name, TimeoutError(f"{name} exceeded {timeout_seconds:.0f}s hard timeout")
     except Exception as exc:  # noqa: BLE001 - deliberately broad, isolated per-source
         logger.warning("Fetcher %s failed: %s", name, exc)
         return name, exc
 
 
+# Per-source hard ceilings. Congress gets the longest budget since it
+# downloads and parses a full year's disclosure index; the others are
+# bounded RSS/API calls that should complete in seconds under normal
+# conditions.
+SOURCE_TIMEOUTS_SECONDS = {
+    "market_news": 30.0,
+    "insiders": 90.0,
+    "congress": 60.0,
+    "egypt_news": 30.0,
+}
+
+
 async def refresh_all() -> dict:
     """Entry point called by /api/refresh and the periodic background task.
-    Returns a summary dict; never raises -- individual source failures are
+    Returns a summary dict; never raises -- individual source failures
+    (including hangs, via the wait_for ceiling in _run_source) are
     captured and reported, not propagated."""
     results = await asyncio.gather(
-        _run_source("market_news", market_news_fetcher.fetch_market_news()),
-        _run_source("insiders", _fetch_insiders_for_tracked_universe()),
-        _run_source("congress", congress_fetcher.fetch_house_clerk_index(datetime.now(timezone.utc).year)),
-        _run_source("egypt_news", egypt_fetcher.fetch_egypt_news()),
+        _run_source("market_news", market_news_fetcher.fetch_market_news(), SOURCE_TIMEOUTS_SECONDS["market_news"]),
+        _run_source("insiders", _fetch_insiders_for_tracked_universe(), SOURCE_TIMEOUTS_SECONDS["insiders"]),
+        _run_source(
+            "congress",
+            congress_fetcher.fetch_house_clerk_index(datetime.now(timezone.utc).year),
+            SOURCE_TIMEOUTS_SECONDS["congress"],
+        ),
+        _run_source("egypt_news", egypt_fetcher.fetch_egypt_news(), SOURCE_TIMEOUTS_SECONDS["egypt_news"]),
         return_exceptions=False,  # _run_source already isolates exceptions
     )
 
@@ -75,6 +101,7 @@ async def refresh_all() -> dict:
         summary[name] = {"status": "ok", "count": len(result)}
         await _store_items(name, result)
         await db.record_feed_success(name)
+        logger.info("Fetcher %s succeeded: %d items", name, len(result))
 
         if name == "market_news":
             market_news_items = result
