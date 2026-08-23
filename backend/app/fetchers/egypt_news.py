@@ -14,6 +14,7 @@ before shipping anything commercial.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -55,10 +56,32 @@ async def _fetch_gdelt(query: str) -> dict[str, Any]:
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
     }
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(GDELT_DOC_API, params=params, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+    # GDELT's real-world 429 behavior (per multiple independent reports)
+    # is stickier than a simple rate limit: bursts can trigger blocks
+    # lasting well beyond a single Retry-After window, and hammering it
+    # with immediate retries makes it worse, not better. So: try once,
+    # and if 429'd, respect Retry-After if given, otherwise back off for
+    # a full extra rate-limit period once and try exactly one more time.
+    # Beyond that, give up cleanly for this cycle -- the next scheduled
+    # refresh (30 min later) is a more realistic recovery point than
+    # anything this function can force within a single call.
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(GDELT_DOC_API, params=params, headers=headers)
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                wait_seconds = float(retry_after) if retry_after and retry_after.isdigit() else 5.0
+                last_exc = httpx.HTTPStatusError(
+                    f"429 from GDELT (attempt {attempt + 1}/2)", request=resp.request, response=resp
+                )
+                if attempt == 0:
+                    await asyncio.sleep(wait_seconds)
+                    continue
+                raise last_exc
+            resp.raise_for_status()
+            return resp.json()
+    raise last_exc  # unreachable given the loop above, but keeps type-checkers happy
 
 
 def process_article(raw: dict[str, Any]) -> dict[str, Any] | None:

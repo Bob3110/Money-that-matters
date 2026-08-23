@@ -65,7 +65,15 @@ async def _run_source(name: str, coro, timeout_seconds: float) -> tuple[str, lis
 # conditions.
 SOURCE_TIMEOUTS_SECONDS = {
     "market_news": 30.0,
-    "insiders": 90.0,
+    # ~500 tickers x (1 submissions.json + up to 2 XML fetches for tickers
+    # with recent Form 4s) against a shared 10 req/s SEC budget can run
+    # several minutes in the worst case. This is a real tradeoff: the
+    # manual /api/refresh endpoint blocks on this, so a full sweep will
+    # feel slow from the frontend's Refresh button. Moving to a proper
+    # background job queue (rather than blocking the request) is the
+    # right fix if this becomes a UX problem -- documented here rather
+    # than silently living with it.
+    "insiders": 240.0,
     "congress": 60.0,
     "egypt_news": 30.0,
 }
@@ -122,6 +130,16 @@ async def _fetch_insiders_for_tracked_universe() -> list:
     market-wide catch-all, per the build spec. Per-ticker sweeps are
     prioritized; the market-wide sweep supplements them."""
     tickers = sorted(tracked_universe.all())
+
+    # Resolve the ticker->CIK map exactly once before fanning out to ~500
+    # concurrent per-ticker calls. Without this, a single transient failure
+    # on the very first lookup meant every one of those callers
+    # independently retried the same failing request for the rest of the
+    # sweep's time budget -- see insiders.py's _get_ticker_to_cik_map
+    # docstring for the full story; this is the fix on the caller side.
+    resolved_count = await insiders_fetcher.prewarm_ticker_cik_map()
+    logger.info("CIK map prewarm resolved %d tickers before per-ticker sweep", resolved_count)
+
     per_ticker_results = []
 
     # Bound concurrency so we don't blow past SEC's 10 req/s limit --

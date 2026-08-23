@@ -21,6 +21,7 @@ import feedparser
 import httpx
 
 from ..allowlist import source_gate_us
+from ..company_names import find_tickers_by_company_name
 from ..dates import parse_item_date
 from ..rate_limiter import throttle
 from ..relevance import passes_us_subject_gate
@@ -44,7 +45,13 @@ from ..universe import tracked_universe
 # without first verifying it actually returns 200 with real content --
 # see this comment's history for why that check matters.
 RSS_FEEDS: dict[str, str] = {
-    "https://www.cnbc.com/id/10001147/device/rss/rss.html": "CNBC (Markets)",
+    # Labeled accurately based on CNBC's own feed descriptions, not
+    # assumed -- the original label here ("CNBC (Markets)") was wrong;
+    # id/10001147 is actually CNBC's CEO/company-news feed. Still real,
+    # still business-relevant content, just mislabeled before.
+    "https://www.cnbc.com/id/10001147/device/rss/rss.html": "CNBC (CEOs & Companies)",
+    "https://www.cnbc.com/id/10000664/device/rss/rss.html": "CNBC (Finance)",
+    "https://www.cnbc.com/id/100370673/device/rss/rss.html": "CNBC (Earnings)",
     # Bloomberg and WSJ do not offer full public RSS for markets content;
     # in production these are reached via their official partner feeds or
     # licensed API, not scraped -- left as a documented gap rather than a
@@ -64,12 +71,20 @@ async def _fetch_feed(url: str) -> feedparser.FeedParserDict:
 
 
 def _extract_tickers(text: str, universe: frozenset[str]) -> set[str]:
-    """Very deliberately conservative: only matches whole-word uppercase
-    tokens that are already in the tracked universe (or the seed list being
-    evaluated for entry) -- never invents a ticker that isn't a real,
-    verifiable symbol."""
-    words = {w.strip("$().,:;\"'").upper() for w in text.split()}
-    return words & universe
+    """Two matching strategies, combined:
+    1. Literal ticker symbols as whole-word uppercase tokens (e.g. "AAPL")
+       -- rare in real headlines but occasionally used, especially in
+       parenthetical asides like "Apple (AAPL)".
+    2. Company names (e.g. "Apple"), via company_names.py's normalized
+       matcher -- this is what most real headlines actually use. Never
+       invents a ticker that isn't a real, verifiable symbol already in
+       the tracked universe; the name matcher only returns tickers already
+       present in `universe`.
+    """
+    literal_words = {w.strip("$().,:;\"'").upper() for w in text.split()}
+    from_symbols = literal_words & universe
+    from_names = find_tickers_by_company_name(text, universe)
+    return from_symbols | from_names
 
 
 async def process_feed_entry(
@@ -94,8 +109,7 @@ async def process_feed_entry(
         return None
 
     universe = tracked_universe.all()
-    mentioned = _extract_tickers(headline, universe | {"CANDIDATE"})  # candidate extraction is a placeholder for an NER/lookup step
-    mentioned.discard("CANDIDATE")
+    mentioned = _extract_tickers(headline, universe)
 
     if not passes_us_subject_gate(
         headline=headline,

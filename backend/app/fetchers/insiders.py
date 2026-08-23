@@ -13,13 +13,13 @@ Endpoints used:
     earlier version of this module assumed JSON here; that was wrong and
     would have raised on first real use. Fixed to parse Atom via feedparser,
     consistent with market_news.py's approach.
-  - Per-ticker: requires resolving ticker -> CIK first (via
-    https://www.sec.gov/files/company_tickers.json, cached), then querying
-    https://data.sec.gov/submissions/CIK{cik}.json for that company's recent
-    filings and filtering to Form 4. NOT YET IMPLEMENTED -- see
-    fetch_insiders_for_ticker below, which is a documented stub rather than
-    a silently-broken implementation. Until this lands, only the
-    market-wide sweep runs; per-ticker coverage is a known gap.
+  - Per-ticker: resolves ticker -> CIK via
+    https://www.sec.gov/files/company_tickers.json (cached in-process),
+    then queries https://data.sec.gov/submissions/CIK{cik}.json for that
+    company's recent filings, filters to Form 4, and fetches+parses each
+    filing's actual XML document for the transaction detail. Bounded to
+    MAX_FILINGS_PER_TICKER per ticker to keep the full ~500-ticker sweep's
+    request count tractable under SEC's shared 10 req/s limit.
 
 This was written against the documented shapes of these endpoints without
 the ability to make a live call from the build sandbox. Railway's runtime
@@ -30,6 +30,9 @@ early failures here as expected debugging, not a design failure.
 
 from __future__ import annotations
 
+import logging
+import re
+import xml.etree.ElementTree as ET
 from typing import Any
 
 import feedparser
@@ -39,6 +42,8 @@ from ..config import SEC_USER_AGENT
 from ..dates import parse_item_date
 from ..rate_limiter import throttle
 from ..relevance import is_valid_us_ticker
+
+logger = logging.getLogger("mtm.fetchers.insiders")
 
 SEC_SUBMISSIONS_HOST = "data.sec.gov"
 SEC_BROWSE_HOST = "www.sec.gov"
@@ -61,16 +66,20 @@ async def _fetch_json(url: str, host: str) -> dict[str, Any]:
         resp.raise_for_status()
         return resp.json()
 
-
-import re
-import xml.etree.ElementTree as ET
-
 # Cap how many filings we open per market-wide sweep -- each filing costs
 # two extra requests (index page + XML doc) on top of the atom feed itself,
 # and SEC's 10 req/s limit is shared across every fetcher hitting sec.gov
 # (see rate_limiter.py), so an unbounded sweep would starve Market News's
 # 8-K pulls on the same host.
 MAX_FILINGS_PER_SWEEP = 20
+
+# Cap per ticker in the per-ticker sweep. With ~500 tickers in the tracked
+# universe, even 1 filing/ticker is ~1000 requests (1 submissions.json +
+# up to N XML fetches per ticker) against a shared 10 req/s budget --
+# multiplying this up scales runtime linearly, so keep it small and let
+# successive refresh cycles pick up anything missed rather than trying to
+# fetch everything in one pass.
+MAX_FILINGS_PER_TICKER = 2
 
 _XML_LINK_RE = re.compile(r'href="([^"]+\.xml)"', re.IGNORECASE)
 
@@ -198,16 +207,100 @@ async def _fetch_and_parse_filing(index_page_url: str) -> dict[str, Any] | None:
         return parse_form4_xml(resp.content, source_url=xml_url)
 
 
+_company_tickers_cache: dict[str, str] | None = None
+_company_tickers_cache_failed = False
+
+
+async def _get_ticker_to_cik_map() -> dict[str, str]:
+    """Resolve ticker -> zero-padded 10-digit CIK via SEC's official
+    company_tickers.json (no key required). Cached in-process for the life
+    of the container -- this file changes rarely and re-fetching it on
+    every ticker lookup would waste a meaningful fraction of the 10 req/s
+    budget shared with every other sec.gov call.
+
+    Also caches FAILURE, not just success. Without this, a single bad
+    fetch (network blip, transient 5xx) meant every one of ~500 concurrent
+    per-ticker callers would independently retry the same failing request
+    for the rest of the refresh cycle -- burning the entire per-ticker
+    sweep's time budget on one endpoint and silently producing zero
+    results everywhere, which is exactly what the first live run showed.
+    A failed resolution now fails fast and loud instead."""
+    global _company_tickers_cache, _company_tickers_cache_failed
+    if _company_tickers_cache is not None:
+        return _company_tickers_cache
+    if _company_tickers_cache_failed:
+        return {}
+
+    try:
+        data = await _fetch_json("https://www.sec.gov/files/company_tickers.json", SEC_BROWSE_HOST)
+    except httpx.HTTPError as exc:
+        _company_tickers_cache_failed = True
+        logger.error("Failed to resolve ticker->CIK map, insiders per-ticker sweep will return nothing this cycle: %s", exc)
+        return {}
+
+    mapping: dict[str, str] = {}
+    for entry in data.values():
+        ticker = str(entry.get("ticker", "")).strip().upper()
+        cik = entry.get("cik_str")
+        if ticker and cik is not None:
+            mapping[ticker] = str(cik).zfill(10)
+    _company_tickers_cache = mapping
+    logger.info("Resolved ticker->CIK map: %d entries", len(mapping))
+    return mapping
+
+
+async def prewarm_ticker_cik_map() -> int:
+    """Public entry point for callers (refresh.py) that want to resolve
+    the CIK map exactly once, up front, rather than lazily from inside
+    hundreds of concurrent per-ticker callers. Returns the number of
+    tickers resolved (0 means resolution failed -- see logs)."""
+    mapping = await _get_ticker_to_cik_map()
+    return len(mapping)
+
+
 async def fetch_insiders_for_ticker(ticker: str) -> list[dict[str, Any]]:
-    """NOT YET IMPLEMENTED. Requires resolving ticker -> CIK first (via
-    https://www.sec.gov/files/company_tickers.json, cached) before this can
-    query a specific company's filing history. Returns an empty list rather
-    than raising, so callers treat 'no per-ticker coverage yet' the same as
-    'no filings found' -- both correctly show nothing rather than crashing
-    the whole Insiders refresh. This is a known, documented gap, not a
-    silent failure: see refresh_job.py, which currently only calls
-    fetch_insiders_market_wide()."""
-    return []
+    """Real implementation: resolve CIK, pull that company's recent filing
+    index from data.sec.gov/submissions (which lists form types directly,
+    no atom-feed indirection needed for this part), filter to Form 4, then
+    fetch+parse each filing's actual XML for the transaction detail.
+    Bounded to the most recent MAX_FILINGS_PER_TICKER per ticker to keep
+    the full-universe sweep's total request count tractable under SEC's
+    shared 10 req/s limit -- see refresh.py's SOURCE_TIMEOUTS_SECONDS for
+    how this is budgeted against the overall insiders timeout."""
+    cik_map = await _get_ticker_to_cik_map()
+    cik = cik_map.get(ticker.strip().upper())
+    if cik is None:
+        return []  # not in SEC's list under this exact symbol -- honest empty, not a guess
+
+    try:
+        data = await _fetch_json(f"https://{SEC_SUBMISSIONS_HOST}/submissions/CIK{cik}.json", SEC_SUBMISSIONS_HOST)
+    except httpx.HTTPError:
+        return []
+
+    recent = data.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    accessions = recent.get("accessionNumber", [])
+    primary_docs = recent.get("primaryDocument", [])
+
+    form4_indices = [i for i, f in enumerate(forms) if f == "4"][:MAX_FILINGS_PER_TICKER]
+
+    results: list[dict[str, Any]] = []
+    cik_int = str(int(cik))
+    for i in form4_indices:
+        accession_nodash = accessions[i].replace("-", "")
+        doc_url = f"https://{SEC_BROWSE_HOST}/Archives/edgar/data/{cik_int}/{accession_nodash}/{primary_docs[i]}"
+        await throttle(SEC_BROWSE_HOST)
+        headers = {"User-Agent": SEC_USER_AGENT}
+        try:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                resp = await client.get(doc_url, headers=headers)
+                resp.raise_for_status()
+                parsed = parse_form4_xml(resp.content, source_url=doc_url)
+        except (httpx.HTTPError, ET.ParseError):
+            continue  # one bad filing shouldn't abort this ticker's whole sweep
+        if parsed is not None:
+            results.append(parsed)
+    return results
 
 
 async def fetch_insiders_market_wide() -> list[dict[str, Any]]:
@@ -215,15 +308,19 @@ async def fetch_insiders_market_wide() -> list[dict[str, Any]]:
         f"https://{SEC_BROWSE_HOST}/cgi-bin/browse-edgar?action=getcurrent&type=4&output=atom",
         SEC_BROWSE_HOST,
     )
+    entries = feed.get("entries", [])
+    logger.info("Market-wide Form 4 atom feed returned %d entries (parsing up to %d)", len(entries), MAX_FILINGS_PER_SWEEP)
     results: list[dict[str, Any]] = []
-    for entry in feed.get("entries", [])[:MAX_FILINGS_PER_SWEEP]:
+    for entry in entries[:MAX_FILINGS_PER_SWEEP]:
         link = entry.get("link")
         if not link:
             continue
         try:
             parsed = await _fetch_and_parse_filing(link)
-        except (httpx.HTTPError, ET.ParseError):
+        except (httpx.HTTPError, ET.ParseError) as exc:
+            logger.debug("Skipping one market-wide filing (%s): %s", link, exc)
             continue  # one bad filing shouldn't abort the whole sweep
         if parsed is not None:
             results.append(parsed)
+    logger.info("Market-wide sweep parsed %d usable transactions from %d entries", len(results), len(entries))
     return results
