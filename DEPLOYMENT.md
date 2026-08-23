@@ -93,13 +93,30 @@ before first run, and refresh it periodically as index membership changes.
 
 ## 7. Before you flip it live
 
-- [ ] CORS locked to real frontend origin
-- [ ] Real `SEC_USER_AGENT` set
+- [x] CORS locked to real frontend origin — `https://money-that-matters.vercel.app`
+- [x] Real `SEC_USER_AGENT` set — ahmedihab3110@gmail.com
 - [ ] Congress data path chosen, and legal sign-off obtained if monetizing
-- [ ] Ticker universe seed populated with real, sourced data
-- [ ] Scheduler configured for the four fetchers (not just the manual
-      Refresh button)
-- [ ] Mongo instance provisioned and `MONGO_URI` set
+      — currently using the free self-built House Clerk XML scraper
+      (filings only, no ticker; see congress.py)
+- [x] Ticker universe seed populated with real, sourced data — 501 S&P 500
+      constituents from github.com/datasets/s-and-p-500-companies (public
+      domain, ODC-PDDL), see `backend/app/data/ticker_universe_seed.json`
+- [x] Scheduler configured — background asyncio task in `main.py`'s
+      lifespan, running `refresh_all()` every 30 minutes, plus the manual
+      `/api/refresh` endpoint the frontend's Refresh button calls
+- [x] Mongo instance provisioned — MongoDB Atlas free cluster, `MONGO_URI` set
 - [ ] Ran the app against real traffic long enough to confirm feed modes
       (live/stale/empty) behave as expected and no source's schema has
-      drifted since these fetchers were written
+      drifted since these fetchers were written — deployed but not yet
+      observed through a full refresh cycle; watch the first real run
+
+## 8. Current live deployment
+
+- Frontend: https://money-that-matters.vercel.app
+- Backend: https://backend-v2-production-7298.up.railway.app
+- Database: MongoDB Atlas, `mtm-cluster` (free tier)
+
+Note: an earlier Railway service (`backend`, not `backend-v2`) was created
+during setup and hit a stuck builder instance that never recovered across
+4 retries — it's dead and unused. Safe to delete from the Railway
+dashboard; `backend-v2` is the real one wired to the frontend.
