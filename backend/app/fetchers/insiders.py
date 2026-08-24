@@ -99,6 +99,24 @@ MAX_FILINGS_PER_TICKER = 2
 
 _XML_LINK_RE = re.compile(r'href="([^"]+\.xml)"', re.IGNORECASE)
 
+_XSLT_VIEWER_SEGMENT_RE = re.compile(r"/xslF\d+X\d+/")
+
+
+def _strip_xslt_viewer_segment(url: str) -> str:
+    """SEC serves TWO documents at the same filename for ownership forms:
+    the raw machine-readable XML at the accession root, and a
+    stylesheet-rendered HTML file *also named `*.xml`* one directory down,
+    under a path segment like 'xslF345X06/'. That second one is a real
+    document -- it has a <!DOCTYPE html> declaration and HTML markup --
+    despite the .xml extension, and ET.fromstring correctly rejects it as
+    malformed XML. Confirmed live: 100% of a 1000-fetch per-ticker sweep
+    and a 20-fetch market-wide sweep hit this exact file and got
+    xml_parse_error on every single one, despite every fetch itself
+    succeeding with 200 OK. The fix: strip the stylesheet segment to reach
+    the sibling raw XML file, which lives at the same filename one
+    directory up."""
+    return _XSLT_VIEWER_SEGMENT_RE.sub("/", url)
+
 
 def _ns_strip(tag: str) -> str:
     return tag.split("}", 1)[-1] if "}" in tag else tag
@@ -241,7 +259,8 @@ async def _find_form4_xml_url(index_page_url: str, host: str) -> str | None:
         match = _XML_LINK_RE.search(resp.text)
         if not match:
             return None
-        return _resolve_xml_href(match.group(1), index_page_url, host)
+        resolved = _resolve_xml_href(match.group(1), index_page_url, host)
+        return _strip_xslt_viewer_segment(resolved)
 
 
 async def _fetch_and_parse_filing(index_page_url: str) -> dict[str, Any] | None:
@@ -337,7 +356,16 @@ async def fetch_insiders_for_ticker(ticker: str) -> list[dict[str, Any]]:
     cik_int = str(int(cik))
     for i in form4_indices:
         accession_nodash = accessions[i].replace("-", "")
-        doc_url = f"https://{SEC_BROWSE_HOST}/Archives/edgar/data/{cik_int}/{accession_nodash}/{primary_docs[i]}"
+        # SEC's submissions.json primaryDocument field for ownership forms
+        # is often the XSLT-stylesheet-rendered path (e.g.
+        # 'xslF345X06/wk-form4_....xml') rather than the raw XML filename
+        # -- confirmed live, this produced 1000/1000 xml_parse_error
+        # across a full per-ticker sweep despite every fetch succeeding
+        # with 200 OK. Strip it to reach the real machine-readable
+        # sibling file. See _strip_xslt_viewer_segment's docstring.
+        doc_url = _strip_xslt_viewer_segment(
+            f"https://{SEC_BROWSE_HOST}/Archives/edgar/data/{cik_int}/{accession_nodash}/{primary_docs[i]}"
+        )
         await throttle(SEC_BROWSE_HOST)
         headers = {"User-Agent": SEC_USER_AGENT}
         try:

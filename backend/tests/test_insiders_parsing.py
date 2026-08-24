@@ -1,4 +1,28 @@
-from app.fetchers.insiders import _resolve_xml_href, parse_form4_xml
+from app.fetchers.insiders import _resolve_xml_href, _strip_xslt_viewer_segment, parse_form4_xml
+
+
+class TestStripXsltViewerSegment:
+    def test_strips_xslF345X06_segment(self):
+        # This is the exact bug confirmed live: SEC's primaryDocument
+        # field and index-page links point at the XSLT-rendered HTML
+        # view (still named *.xml) rather than the raw machine-readable
+        # XML, causing ET.fromstring to fail on every single fetch
+        # (1000/1000 in one live sweep) despite every HTTP request
+        # succeeding with 200 OK.
+        result = _strip_xslt_viewer_segment(
+            "https://www.sec.gov/Archives/edgar/data/1857816/000162828026058507/xslF345X06/wk-form4_1787363036.xml"
+        )
+        assert result == "https://www.sec.gov/Archives/edgar/data/1857816/000162828026058507/wk-form4_1787363036.xml"
+
+    def test_leaves_non_viewer_url_unchanged(self):
+        url = "https://www.sec.gov/Archives/edgar/data/911421/000112760211031166/form4.xml"
+        assert _strip_xslt_viewer_segment(url) == url
+
+    def test_handles_different_schema_version_numbers(self):
+        result = _strip_xslt_viewer_segment(
+            "https://www.sec.gov/Archives/edgar/data/1/2/xslF345X05/doc.xml"
+        )
+        assert "xslF345X05" not in result
 
 
 class TestResolveXmlHref:
