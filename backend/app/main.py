@@ -18,6 +18,14 @@ from .routers import feeds, money_match
 # is why those runs produced feed_status successes with zero stored items
 # and no visible explanation in the logs.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# httpx logs one INFO line per HTTP request by default. At the volume this
+# app makes real per-ticker/per-filing calls (hundreds per refresh cycle),
+# that completely floods out this app's own diagnostic logs -- which is
+# exactly what made the market_news per-feed diagnostic line impossible to
+# find in a live deploy's log stream. Quieted to WARNING; this app's own
+# loggers (mtm.*) stay at INFO.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger("mtm.main")
 
