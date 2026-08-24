@@ -16,6 +16,7 @@ universe.tracked_universe so Insiders starts checking it too.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from typing import Any
 
 import feedparser
@@ -30,6 +31,20 @@ from ..sentiment import classify
 from ..universe import tracked_universe
 
 logger = logging.getLogger("mtm.fetchers.market_news")
+
+# Aggregate rejection-reason counts, same pattern as insiders.py's
+# _parse_stats -- exists so a caller can log one summary line per feed
+# instead of either flooding with a per-item DEBUG line or, as happened
+# on the first live run after switching CNBC endpoints, having zero
+# visibility into WHY '30 raw entries, 0 passed' happened.
+_reject_stats: Counter = Counter()
+
+
+def reset_and_snapshot_reject_stats() -> dict[str, int]:
+    global _reject_stats
+    snapshot = dict(_reject_stats)
+    _reject_stats = Counter()
+    return snapshot
 
 # Outlets' own RSS feeds -- source gate is inherent because we only ever
 # request from these hosts in the first place. Business/markets-desk feeds
@@ -128,20 +143,40 @@ async def process_feed_entry(
     outlet: str,
     is_markets_business_desk: bool,
 ) -> dict[str, Any] | None:
+    global _reject_stats
     headline = entry.get("title", "")
-    link = entry.get("link", "")
-    published_raw = entry.get("published") or entry.get("updated")
+    # The search.cnbc.com/combinedcms endpoint (switched to after the old
+    # device/rss/rss.html wrapper was confirmed to silently return
+    # zero-parseable content) may structure the article URL under a
+    # different feedparser field than the standard 'link' -- confirmed
+    # live: switching endpoints took CNBC from '30 raw entries, 0 passed'
+    # for all three feeds simultaneously, which is the signature of every
+    # item failing the SAME early check (source gate on an empty link),
+    # not genuinely irrelevant content. Try the standard field first, then
+    # documented feedparser fallbacts for feeds that put the URL in
+    # 'id'/'guid' instead.
+    link = entry.get("link") or entry.get("id") or entry.get("guid") or ""
+    published_raw = entry.get("published") or entry.get("updated") or entry.get("pubDate")
+
+    if not link:
+        _reject_stats["no_link"] += 1
+        return None
+    if not headline:
+        _reject_stats["no_headline"] += 1
+        return None
+    if not published_raw:
+        _reject_stats["no_date"] += 1
+        return None
 
     outlet_name = source_gate_us(link)
     if outlet_name is None:
+        _reject_stats["source_gate"] += 1
         return None  # fails source gate -- discard, do not attribute elsewhere
-
-    if not headline or not link or not published_raw:
-        return None  # partial data beats fake data, but here nothing usable remains
 
     try:
         published_at = parse_item_date(published_raw)
     except ValueError:
+        _reject_stats["unparseable_date"] += 1
         return None
 
     universe = tracked_universe.all()
@@ -153,6 +188,7 @@ async def process_feed_entry(
         mentioned_tickers=mentioned,
         is_markets_business_desk=is_markets_business_desk,
     ):
+        _reject_stats["subject_gate"] += 1
         return None
 
     lean_value = classify(headline)
@@ -162,6 +198,7 @@ async def process_feed_entry(
     if ticker:
         tracked_universe.add(ticker)  # growable universe -- see universe.py
 
+    _reject_stats["accepted"] += 1
     return {
         "ticker": ticker,
         "headline": headline,
@@ -185,7 +222,7 @@ async def fetch_market_news() -> list[dict[str, Any]]:
                 results.append(parsed)
                 passed += 1
         logger.info(
-            "%s: fetched %d raw entries, %d passed both gates (tracked universe size: %d)",
-            outlet, len(raw_entries), passed, universe_size,
+            "%s: fetched %d raw entries, %d passed both gates (tracked universe size: %d), reject reasons: %s",
+            outlet, len(raw_entries), passed, universe_size, reset_and_snapshot_reject_stats(),
         )
     return results

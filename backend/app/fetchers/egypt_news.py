@@ -15,6 +15,7 @@ before shipping anything commercial.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import httpx
@@ -24,6 +25,8 @@ from ..dates import parse_item_date
 from ..rate_limiter import throttle
 from ..relevance import passes_egypt_subject_gate
 from ..sentiment import classify
+
+logger = logging.getLogger("mtm.fetchers.egypt_news")
 
 GDELT_HOST = "api.gdeltproject.org"
 GDELT_DOC_API = "https://api.gdeltproject.org/api/v2/doc/doc"
@@ -68,7 +71,22 @@ async def _fetch_gdelt(query: str) -> dict[str, Any]:
     last_exc: Exception | None = None
     for attempt in range(2):
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(GDELT_DOC_API, params=params, headers=headers)
+            try:
+                resp = await client.get(GDELT_DOC_API, params=params, headers=headers)
+            except (httpx.TimeoutException, httpx.ConnectError) as exc:
+                # These raise from client.get() itself, before any status
+                # code exists to check -- the 429-only retry logic above
+                # never saw this class of failure at all. Confirmed live:
+                # egypt_news failed with an empty error message, which is
+                # httpx.TimeoutException's actual str() representation
+                # (its __str__ returns "" by design), making the failure
+                # look unexplained in logs until named explicitly here.
+                last_exc = exc
+                logger.warning("GDELT request failed (attempt %d/2): %s: %s", attempt + 1, type(exc).__name__, exc)
+                if attempt == 0:
+                    await asyncio.sleep(3.0)
+                    continue
+                raise
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After")
                 wait_seconds = float(retry_after) if retry_after and retry_after.isdigit() else 5.0
