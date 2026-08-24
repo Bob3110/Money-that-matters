@@ -47,14 +47,24 @@ logger = logging.getLogger("mtm.fetchers.market_news")
 # is no working public feed to pull. Do not re-add a Reuters RSS URL
 # without first verifying it actually returns 200 with real content --
 # see this comment's history for why that check matters.
+#
+# CNBC's www.cnbc.com/id/<id>/device/rss/rss.html pages are a browser-
+# facing wrapper, not the raw feed -- a live run confirmed they return
+# 200 OK with a body feedparser silently parses into zero entries for a
+# non-browser client (same failure shape as the Reuters 401, just
+# swallowed instead of raised). CNBC's own RSSHub integration reveals
+# the real underlying machine-readable endpoint below, which is what
+# every third-party CNBC RSS tool actually calls.
+CNBC_FEED_API = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id={feed_id}"
+
 RSS_FEEDS: dict[str, str] = {
     # Labeled accurately based on CNBC's own feed descriptions, not
     # assumed -- the original label here ("CNBC (Markets)") was wrong;
     # id/10001147 is actually CNBC's CEO/company-news feed. Still real,
     # still business-relevant content, just mislabeled before.
-    "https://www.cnbc.com/id/10001147/device/rss/rss.html": "CNBC (CEOs & Companies)",
-    "https://www.cnbc.com/id/10000664/device/rss/rss.html": "CNBC (Finance)",
-    "https://www.cnbc.com/id/100370673/device/rss/rss.html": "CNBC (Earnings)",
+    CNBC_FEED_API.format(feed_id="10001147"): "CNBC (CEOs & Companies)",
+    CNBC_FEED_API.format(feed_id="10000664"): "CNBC (Finance)",
+    CNBC_FEED_API.format(feed_id="100370673"): "CNBC (Earnings)",
     # Bloomberg and WSJ do not offer full public RSS for markets content;
     # in production these are reached via their official partner feeds or
     # licensed API, not scraped -- left as a documented gap rather than a
@@ -67,10 +77,33 @@ SEC_8K_FEED = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8
 async def _fetch_feed(url: str) -> feedparser.FeedParserDict:
     host = httpx.URL(url).host
     await throttle(host)
+    # A generic app UA got Reuters to 401 outright; CNBC's wrapper pages
+    # silently returned parseable-but-empty content to the same UA
+    # instead of erroring, which is a harder failure to notice. Using a
+    # real browser UA here isn't about impersonating a browser to evade
+    # blocking policy -- it's matching what CNBC's own documented,
+    # third-party-tool-recommended endpoint (search.cnbc.com's combinedcms
+    # view) expects from any RSS client.
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
     async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url, headers={"User-Agent": "MoneyThatMatters/0.1"})
+        resp = await client.get(url, headers=headers)
         resp.raise_for_status()
-        return feedparser.parse(resp.text)
+        parsed = feedparser.parse(resp.text)
+        if not parsed.get("entries"):
+            # Don't just report "0 items" with no way to tell fetch
+            # failure from genuinely-empty feed apart -- log enough of
+            # the raw response to diagnose which one this is, without
+            # dumping the whole body.
+            logger.warning(
+                "Feed at %s returned 0 entries. Response length=%d, first 200 chars: %r",
+                url, len(resp.text), resp.text[:200],
+            )
+        return parsed
 
 
 def _extract_tickers(text: str, universe: frozenset[str]) -> set[str]:

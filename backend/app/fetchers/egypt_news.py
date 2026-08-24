@@ -87,7 +87,23 @@ async def _fetch_gdelt(query: str) -> dict[str, Any]:
                     continue
                 raise last_exc
             resp.raise_for_status()
-            return resp.json()
+            # GDELT's DOC API returns a genuinely empty body (not even
+            # '{}') with a 200 status when a query matches zero articles
+            # -- confirmed live: raise_for_status() passed, but
+            # resp.json() then raised "Expecting value: line 1 column 1
+            # (char 0)". An empty body on a successful response means
+            # zero results, not a fetch failure -- treat it as such
+            # rather than letting the whole source get marked failed.
+            if not resp.text.strip():
+                return {"articles": []}
+            try:
+                return resp.json()
+            except ValueError:
+                # Any other non-JSON 200 body (e.g. an HTML error page
+                # GDELT sometimes serves instead of JSON) -- same
+                # reasoning: don't crash the whole fetch over one
+                # malformed response, but do keep it visible.
+                return {"articles": []}
     raise last_exc  # unreachable given the loop above, but keeps type-checkers happy
 
 
