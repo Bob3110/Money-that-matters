@@ -75,7 +75,7 @@ SOURCE_TIMEOUTS_SECONDS = {
     # than silently living with it.
     "insiders": 240.0,
     "congress": 60.0,
-    "egypt_news": 30.0,
+    "egypt_news": 45.0,
 }
 
 

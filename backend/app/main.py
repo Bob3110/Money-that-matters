@@ -10,6 +10,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from . import refresh as refresh_module
 from .routers import feeds, money_match
 
+# Without this, Python's root logger defaults to WARNING, which silently
+# discards every logger.info() call throughout this app -- including the
+# diagnostic counts in refresh.py and the fetchers (CIK map resolution,
+# per-source item counts) that are exactly what's needed to debug a live
+# deploy. This was missing for the app's first several live runs, which
+# is why those runs produced feed_status successes with zero stored items
+# and no visible explanation in the logs.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
 logger = logging.getLogger("mtm.main")
 
 # How often the background task refreshes all four feeds, in seconds.

@@ -72,6 +72,13 @@ async def _fetch_gdelt(query: str) -> dict[str, Any]:
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After")
                 wait_seconds = float(retry_after) if retry_after and retry_after.isdigit() else 5.0
+                # Cap the wait regardless of what GDELT asks for -- this
+                # function runs inside refresh.py's 45s hard timeout for
+                # egypt_news; a large Retry-After value plus two request
+                # round-trips could otherwise blow that budget and get
+                # cancelled mid-sleep, which is strictly worse than just
+                # giving up after a bounded wait.
+                wait_seconds = min(wait_seconds, 15.0)
                 last_exc = httpx.HTTPStatusError(
                     f"429 from GDELT (attempt {attempt + 1}/2)", request=resp.request, response=resp
                 )
