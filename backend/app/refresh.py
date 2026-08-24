@@ -160,9 +160,16 @@ async def _fetch_insiders_for_tracked_universe() -> list:
         batches = await asyncio.gather(*(bounded_fetch(t) for t in tickers))
         for batch in batches:
             per_ticker_results.extend(batch)
+    ticker_sweep_stats = insiders_fetcher.reset_and_snapshot_parse_stats()
+    logger.info(
+        "Per-ticker sweep: %d tickers checked, %d usable transactions found, reject reasons: %s",
+        len(tickers), len(per_ticker_results), ticker_sweep_stats,
+    )
 
     try:
         market_wide = await insiders_fetcher.fetch_insiders_market_wide()
+        market_wide_stats = insiders_fetcher.reset_and_snapshot_parse_stats()
+        logger.info("Market-wide sweep reject reasons: %s", market_wide_stats)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Market-wide insider sweep failed: %s", exc)
         market_wide = []

@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import re
 import xml.etree.ElementTree as ET
+from collections import Counter
 from typing import Any
 
 import feedparser
@@ -44,6 +45,21 @@ from ..rate_limiter import throttle
 from ..relevance import is_valid_us_ticker
 
 logger = logging.getLogger("mtm.fetchers.insiders")
+
+# Aggregate rejection-reason counts, reset per sweep via
+# reset_and_snapshot_parse_stats(). Exists so a caller can log one summary
+# line per sweep (e.g. "derivative_only: 142, accepted: 3") instead of
+# either flooding logs with a DEBUG line per filing or having zero
+# visibility into why a sweep returned nothing -- the exact gap that made
+# the first live run's "0 items, no explanation" outcome hard to diagnose.
+_parse_stats: Counter = Counter()
+
+
+def reset_and_snapshot_parse_stats() -> dict[str, int]:
+    global _parse_stats
+    snapshot = dict(_parse_stats)
+    _parse_stats = Counter()
+    return snapshot
 
 SEC_SUBMISSIONS_HOST = "data.sec.gov"
 SEC_BROWSE_HOST = "www.sec.gov"
@@ -94,10 +110,18 @@ def parse_form4_xml(raw_xml: bytes, source_url: str) -> dict[str, Any] | None:
     genuinely absent -- never guesses a missing field. Only the first
     non-derivative transaction is used if multiple are present; Form 4s
     with only derivative transactions (options, RSUs vesting) are skipped
-    for now rather than misrepresented as open-market buys/sells."""
+    for now rather than misrepresented as open-market buys/sells.
+
+    Every rejection path logs a one-word reason at DEBUG -- the first live
+    run returned 0 usable transactions from ~150+ real, successfully
+    fetched filings with no visibility into why, which turned out to be
+    indistinguishable from "everything happened to be derivative-only"
+    without this. Aggregate reason counts, not per-filing noise, are what
+    matter here; call sites can tally these against total attempts."""
     try:
         root = ET.fromstring(raw_xml)
     except ET.ParseError:
+        _parse_stats["xml_parse_error"] += 1
         return None
 
     def find_text(path: str) -> str | None:
@@ -106,11 +130,13 @@ def parse_form4_xml(raw_xml: bytes, source_url: str) -> dict[str, Any] | None:
 
     symbol = find_text(".//issuer/issuerTradingSymbol")
     if not is_valid_us_ticker(symbol):
+        _parse_stats["invalid_ticker"] += 1
         return None
 
     company = find_text(".//issuer/issuerName") or ""
     insider_name = find_text(".//reportingOwner/reportingOwnerId/rptOwnerName")
     if not insider_name:
+        _parse_stats["no_insider_name"] += 1
         return None
 
     role_parts = []
@@ -131,16 +157,19 @@ def parse_form4_xml(raw_xml: bytes, source_url: str) -> dict[str, Any] | None:
 
     txn = root.find(".//nonDerivativeTable/nonDerivativeTransaction")
     if txn is None:
+        _parse_stats["derivative_only"] += 1
         return None  # derivative-only filing (options/RSUs) -- skipped, not misrepresented
 
     filed_raw = find_text(".//nonDerivativeTransaction/transactionDate/value") or find_text(
         ".//periodOfReport"
     )
     if not filed_raw:
+        _parse_stats["no_date"] += 1
         return None
     try:
         filed_at = parse_item_date(filed_raw)
     except ValueError:
+        _parse_stats["unparseable_date"] += 1
         return None
 
     code = find_text(".//nonDerivativeTransaction/transactionCoding/transactionCode")
@@ -148,10 +177,12 @@ def parse_form4_xml(raw_xml: bytes, source_url: str) -> dict[str, Any] | None:
     price_raw = find_text(".//nonDerivativeTransaction/transactionAmounts/transactionPricePerShare/value")
 
     if code is None or shares_raw is None:
+        _parse_stats["missing_code_or_shares"] += 1
         return None
     try:
         shares = int(float(shares_raw))
     except ValueError:
+        _parse_stats["unparseable_shares"] += 1
         return None
 
     value_usd = None
@@ -161,6 +192,7 @@ def parse_form4_xml(raw_xml: bytes, source_url: str) -> dict[str, Any] | None:
         except ValueError:
             value_usd = None  # left None rather than guessed
 
+    _parse_stats["accepted"] += 1
     return {
         "ticker": symbol.strip().upper(),
         "company": company,
@@ -174,12 +206,33 @@ def parse_form4_xml(raw_xml: bytes, source_url: str) -> dict[str, Any] | None:
     }
 
 
+def _resolve_xml_href(href: str, index_page_url: str, host: str) -> str:
+    """Pure URL-resolution logic, split out from _find_form4_xml_url so it
+    can be unit-tested without a network call. See that function's
+    docstring for why root-relative hrefs need host-only joining."""
+    if href.startswith("http"):
+        return href
+    if href.startswith("/"):
+        return f"https://{host}{href}"
+    base = index_page_url.rsplit("/", 1)[0]
+    return f"{base}/{href.lstrip('/')}"
+
+
 async def _find_form4_xml_url(index_page_url: str, host: str) -> str | None:
     """The atom feed's entry link points at a filing's index HTML page, not
     the Form 4 XML document itself. Fetch that page and pull out the first
     linked .xml file -- SEC's convention names it '<accession>.xml' or
     'xslF345X0*/<accession>.xml', but the exact name varies, so we parse
-    the page rather than guess the filename."""
+    the page rather than guess the filename.
+
+    SEC's index pages link with SITE-ROOT-RELATIVE hrefs (e.g.
+    "/Archives/edgar/data/1857816/000.../form.xml"), not paths relative to
+    the index page's own directory. Joining that kind of href against the
+    index page's directory (as an earlier version of this function did)
+    produces a duplicated, broken path like ".../data/A/.../Archives/edgar/
+    data/B/..." -- confirmed live via a full run of 404s on every one of 20
+    market-wide filings. The fix: root-relative hrefs join against the
+    host only, not the index page's path. See _resolve_xml_href."""
     await throttle(host)
     headers = {"User-Agent": SEC_USER_AGENT}
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
@@ -188,11 +241,7 @@ async def _find_form4_xml_url(index_page_url: str, host: str) -> str | None:
         match = _XML_LINK_RE.search(resp.text)
         if not match:
             return None
-        href = match.group(1)
-        if href.startswith("http"):
-            return href
-        base = index_page_url.rsplit("/", 1)[0]
-        return f"{base}/{href.lstrip('/')}"
+        return _resolve_xml_href(match.group(1), index_page_url, host)
 
 
 async def _fetch_and_parse_filing(index_page_url: str) -> dict[str, Any] | None:

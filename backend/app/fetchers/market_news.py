@@ -15,6 +15,7 @@ universe.tracked_universe so Insiders starts checking it too.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import feedparser
@@ -27,6 +28,8 @@ from ..rate_limiter import throttle
 from ..relevance import passes_us_subject_gate
 from ..sentiment import classify
 from ..universe import tracked_universe
+
+logger = logging.getLogger("mtm.fetchers.market_news")
 
 # Outlets' own RSS feeds -- source gate is inherent because we only ever
 # request from these hosts in the first place. Business/markets-desk feeds
@@ -138,10 +141,18 @@ async def process_feed_entry(
 
 async def fetch_market_news() -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    universe_size = len(tracked_universe.all())
     for url, outlet in RSS_FEEDS.items():
         feed = await _fetch_feed(url)
-        for raw_entry in feed.get("entries", []):
+        raw_entries = feed.get("entries", [])
+        passed = 0
+        for raw_entry in raw_entries:
             parsed = await process_feed_entry(dict(raw_entry), outlet, is_markets_business_desk=True)
             if parsed is not None:
                 results.append(parsed)
+                passed += 1
+        logger.info(
+            "%s: fetched %d raw entries, %d passed both gates (tracked universe size: %d)",
+            outlet, len(raw_entries), passed, universe_size,
+        )
     return results
