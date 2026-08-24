@@ -1,6 +1,6 @@
 import pytest
 
-from app.fetchers.market_news import process_feed_entry, reset_and_snapshot_reject_stats
+from app.fetchers.market_news import _extract_tickers, process_feed_entry, reset_and_snapshot_reject_stats
 
 
 @pytest.mark.asyncio
@@ -72,3 +72,31 @@ class TestPublishedAtResolution:
         result = await process_feed_entry(entry, "CNBC (Earnings)", is_markets_business_desk=True)
         assert result is not None
         assert result["published_at"].day == 24
+
+
+class TestExtractTickersSingleLetterFalsePositive:
+    def test_single_letter_ticker_not_matched_as_word(self):
+        # Regression test: a real live headline "A media M&A chill: the
+        # Paramount-WBD antitrust challenge..." was tagged with ticker
+        # "A" (Agilent's real symbol) purely because "A" is also the
+        # English indefinite article -- a false positive with zero
+        # relationship to the headline's actual content.
+        found = _extract_tickers(
+            "A media M&A chill: the Paramount-WBD antitrust challenge",
+            frozenset({"A", "WBD"}),
+        )
+        assert "A" not in found
+
+    def test_single_letter_company_name_still_matched_via_name_path(self):
+        # The exclusion is specific to the literal-symbol path -- a real
+        # mention of the company's full registered name should still
+        # work. Note: the name matcher requires the full normalized name
+        # ("Agilent Technologies"), not a short-form mention ("Agilent"
+        # alone) -- that's a separate, real precision/recall tradeoff in
+        # company_names.py, not something this fix changes.
+        found = _extract_tickers("Agilent Technologies reports strong earnings", frozenset({"A"}))
+        assert "A" in found
+
+    def test_multi_letter_ticker_still_matched(self):
+        found = _extract_tickers("AAPL shares rose today", frozenset({"AAPL"}))
+        assert "AAPL" in found

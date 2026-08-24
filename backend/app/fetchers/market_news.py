@@ -127,7 +127,13 @@ def _extract_tickers(text: str, universe: frozenset[str]) -> set[str]:
     """Two matching strategies, combined:
     1. Literal ticker symbols as whole-word uppercase tokens (e.g. "AAPL")
        -- rare in real headlines but occasionally used, especially in
-       parenthetical asides like "Apple (AAPL)".
+       parenthetical asides like "Apple (AAPL)". Single-letter tickers
+       (e.g. "A" for Agilent) are excluded from this path -- confirmed
+       live: "A media M&A chill..." matched Agilent's ticker purely
+       because "A" is also the English indefinite article, a false
+       positive with no real relationship to the headline's content.
+       Real mentions of single-letter-ticker companies are still caught
+       via the company-name path below (e.g. "Agilent" itself).
     2. Company names (e.g. "Apple"), via company_names.py's normalized
        matcher -- this is what most real headlines actually use. Never
        invents a ticker that isn't a real, verifiable symbol already in
@@ -135,7 +141,7 @@ def _extract_tickers(text: str, universe: frozenset[str]) -> set[str]:
        present in `universe`.
     """
     literal_words = {w.strip("$().,:;\"'").upper() for w in text.split()}
-    from_symbols = literal_words & universe
+    from_symbols = {w for w in (literal_words & universe) if len(w) > 1}
     from_names = find_tickers_by_company_name(text, universe)
     return from_symbols | from_names
 
