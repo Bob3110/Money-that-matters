@@ -39,3 +39,36 @@ class TestProcessFeedEntryLinkFallback:
         stats = reset_and_snapshot_reject_stats()
         assert stats.get("no_link") == 1
         assert stats.get("source_gate") == 1
+
+
+@pytest.mark.asyncio
+class TestPublishedAtResolution:
+    async def test_uses_feedparser_parsed_struct_when_available(self):
+        # Regression test: switching CNBC endpoints surfaced RFC 822 dates
+        # (the actual RSS 2.0 <pubDate> standard) that dates.py's original
+        # three formats never covered -- 100% of real items failed with
+        # 'unparseable_date' until this preference for feedparser's own
+        # normalized struct existed.
+        reset_and_snapshot_reject_stats()
+        entry = {
+            "title": "Apple reports strong quarterly earnings",
+            "link": "https://www.cnbc.com/2026/08/24/apple-earnings.html",
+            "published": "Mon, 24 Aug 2026 12:00:00 GMT",
+            "published_parsed": (2026, 8, 24, 12, 0, 0, 0, 0, 0),
+        }
+        result = await process_feed_entry(entry, "CNBC (Earnings)", is_markets_business_desk=True)
+        assert result is not None
+        assert result["published_at"].year == 2026
+        assert result["published_at"].month == 8
+        assert result["published_at"].day == 24
+
+    async def test_falls_back_to_raw_string_without_parsed_struct(self):
+        reset_and_snapshot_reject_stats()
+        entry = {
+            "title": "Apple reports strong quarterly earnings",
+            "link": "https://www.cnbc.com/2026/08/24/apple-earnings.html",
+            "published": "2026-08-24T12:00:00Z",
+        }
+        result = await process_feed_entry(entry, "CNBC (Earnings)", is_markets_business_desk=True)
+        assert result is not None
+        assert result["published_at"].day == 24

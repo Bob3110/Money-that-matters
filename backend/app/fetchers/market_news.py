@@ -15,8 +15,10 @@ universe.tracked_universe so Insiders starts checking it too.
 
 from __future__ import annotations
 
+import calendar
 import logging
 from collections import Counter
+from datetime import datetime, timezone
 from typing import Any
 
 import feedparser
@@ -138,6 +140,25 @@ def _extract_tickers(text: str, universe: frozenset[str]) -> set[str]:
     return from_symbols | from_names
 
 
+def _resolve_published_at(entry: dict[str, Any], published_raw: str):
+    """Prefer feedparser's own pre-parsed date struct (published_parsed /
+    updated_parsed -- a 9-tuple struct_time, always normalized to UTC by
+    feedparser regardless of the feed's original date format) over
+    re-parsing the raw string ourselves. feedparser already handles RFC
+    822, RFC 3339/ISO-8601, and several nonstandard variants internally;
+    duplicating that parsing in dates.py's fixed format list is both
+    redundant and, as a live run confirmed, incomplete (RFC 822 -- the
+    actual RSS 2.0 <pubDate> standard -- wasn't in the original three
+    formats dates.py covered, so 100% of items from a real RSS feed
+    failed with 'unparseable_date' until this existed). Falls back to
+    dates.parse_item_date on the raw string only if feedparser didn't
+    produce a parsed struct."""
+    struct = entry.get("published_parsed") or entry.get("updated_parsed")
+    if struct is not None:
+        return datetime.fromtimestamp(calendar.timegm(struct), tz=timezone.utc)
+    return parse_item_date(published_raw)
+
+
 async def process_feed_entry(
     entry: dict[str, Any],
     outlet: str,
@@ -174,7 +195,7 @@ async def process_feed_entry(
         return None  # fails source gate -- discard, do not attribute elsewhere
 
     try:
-        published_at = parse_item_date(published_raw)
+        published_at = _resolve_published_at(entry, published_raw)
     except ValueError:
         _reject_stats["unparseable_date"] += 1
         return None

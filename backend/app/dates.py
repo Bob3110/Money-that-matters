@@ -33,6 +33,18 @@ _FORMATS = (
     "%Y-%m-%dT%H:%M:%S",
     "%m/%d/%Y",
     "%m/%d/%y",
+    # RFC 822/2822 -- the standard RSS <pubDate> format (e.g. "Mon, 24 Aug
+    # 2026 12:00:00 GMT" or "...+0000"). Confirmed live as a real gap:
+    # switching to CNBC's real machine-readable RSS endpoint surfaced
+    # this immediately -- every single item failed with
+    # 'unparseable_date' because this format was never in the original
+    # three example formats from the build spec, even though RFC 822 is
+    # the actual RSS 2.0 standard for pubDate. See also
+    # market_news.py's preference for feedparser's own pre-parsed date
+    # struct, which is the more robust fix; this format is defense in
+    # depth for any raw string that reaches this function directly.
+    "%a, %d %b %Y %H:%M:%S %Z",
+    "%a, %d %b %Y %H:%M:%S %z",
 )
 
 
