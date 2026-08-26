@@ -102,8 +102,16 @@ async def refresh_all() -> dict:
 
     for name, result in results:
         if isinstance(result, Exception):
-            await db.record_feed_failure(name, str(result))
-            summary[name] = {"status": "failed", "error": str(result)}
+            # Several real exception types have an EMPTY str() by design
+            # -- confirmed live, twice, with two different exception
+            # types (httpx.TimeoutException, then something else, both
+            # producing feed_status.error == ""). Always include the
+            # exception's class name so this can never happen again,
+            # regardless of which exception type is thrown next.
+            error_message = f"{type(result).__name__}: {result}" if str(result) else type(result).__name__
+            await db.record_feed_failure(name, error_message)
+            summary[name] = {"status": "failed", "error": error_message}
+            logger.warning("Fetcher %s failed: %s", name, error_message)
             continue
 
         summary[name] = {"status": "ok", "count": len(result)}

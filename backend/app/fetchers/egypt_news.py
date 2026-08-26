@@ -106,7 +106,17 @@ async def _fetch_gdelt(query: str) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=15.0) as client:
             try:
                 resp = await client.get(GDELT_DOC_API, params=params, headers=headers)
-            except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            except httpx.HTTPError as exc:
+                # Broadened from just (TimeoutException, ConnectError) --
+                # confirmed live that a second, different httpx exception
+                # subtype (httpx has ~10: ReadTimeout, PoolTimeout,
+                # RemoteProtocolError, etc., several of which also have
+                # empty str() by design) still slipped through the
+                # narrower catch and surfaced as feed_status.error == "".
+                # httpx.HTTPError is the common base class for all of
+                # them, and refresh.py's error formatting now always
+                # prepends the exception type name regardless, so this is
+                # the last place this class of bug can hide.
                 # These raise from client.get() itself, before any status
                 # code exists to check -- the 429-only retry logic above
                 # never saw this class of failure at all. Confirmed live:
